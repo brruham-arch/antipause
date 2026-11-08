@@ -59,6 +59,94 @@ static EGLBoolean (*orig_ds)(EGLDisplay, EGLSurface) = nullptr;
 static EGLBoolean (*p_qctx)(EGLDisplay, EGLContext, int, int*) = nullptr;
 static EGLBoolean (*p_qsurf)(EGLDisplay, EGLSurface, int, int*) = nullptr;
 
+// ─── Watchdog ─────────────────────────────────────────────
+#include <signal.h>
+#include <pthread.h>
+#include <dirent.h>
+#include <ucontext.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <sys/syscall.h>
+#define WSIG (SIGRTMIN + 6)
+static volatile int g_swaps = 0, g_sigdone = 0, g_wdStarted = 0;
+static uintptr_t g_pc, g_lr, g_stk[64];
+
+static void sigh(int, siginfo_t*, void* u) {
+    ucontext_t* uc = (ucontext_t*)u;
+    g_pc = uc->uc_mcontext.arm_pc; g_lr = uc->uc_mcontext.arm_lr;
+    uintptr_t* sp = (uintptr_t*)uc->uc_mcontext.arm_sp;
+    for (int i = 0; i < 64; i++) g_stk[i] = sp[i];
+    g_sigdone = 1;
+}
+static bool resolve(uintptr_t a, char* out, size_t n, bool needX) {
+    FILE* f = fopen("/proc/self/maps", "r"); if (!f) return false;
+    char line[512]; bool ok = false;
+    while (fgets(line, sizeof line, f)) {
+        unsigned long lo, hi, off; char perm[8]; char path[400] = "";
+        if (sscanf(line, "%lx-%lx %7s %lx %*s %*s %399[^\n]", &lo, &hi, perm, &off, path) < 4) continue;
+        if (a >= lo && a < hi) {
+            if (needX && perm[2] != 'x') break;
+            const char* b = strrchr(path, '/'); b = b ? b + 1 : path;
+            if (needX && !*b) break;
+            snprintf(out, n, "%s+0x%lx", *b ? b : "?", (unsigned long)(a - lo + off));
+            ok = true; break;
+        }
+    }
+    fclose(f); return ok;
+}
+static void rd(const char* path, char* o, size_t n) {
+    o[0] = 0; FILE* f = fopen(path, "r"); if (!f) return;
+    if (fgets(o, n, f)) { size_t l = strlen(o); if (l && o[l-1] == '\n') o[l-1] = 0; }
+    fclose(f);
+}
+static void dumpThreads() {
+    int me = (int)syscall(SYS_gettid);
+    DIR* d = opendir("/proc/self/task"); if (!d) return;
+    struct dirent* e;
+    while ((e = readdir(d))) {
+        int tid = atoi(e->d_name); if (tid <= 0 || tid == me) continue;
+        char p[80], comm[40], st[256], r1[160], r2[160], x[160];
+        snprintf(p, sizeof p, "/proc/self/task/%d/comm", tid); rd(p, comm, sizeof comm);
+        snprintf(p, sizeof p, "/proc/self/task/%d/stat", tid); rd(p, st, sizeof st);
+        char* rp = strrchr(st, ')'); char state = rp ? rp[2] : '?';
+        g_sigdone = 0;
+        syscall(SYS_tgkill, (int)getpid(), tid, WSIG);
+        for (int i = 0; i < 200 && !g_sigdone; i++) usleep(1000);
+        if (!g_sigdone) { logf("[WD] tid=%d %s st=%c (no signal)", tid, comm, state); continue; }
+        if (!resolve(g_pc, r1, sizeof r1, false)) snprintf(r1, sizeof r1, "%lx", (unsigned long)g_pc);
+        if (!resolve(g_lr, r2, sizeof r2, false)) snprintf(r2, sizeof r2, "%lx", (unsigned long)g_lr);
+        logf("[WD] tid=%d %s st=%c pc=%s lr=%s", tid, comm, state, r1, r2);
+        int shown = 0;
+        for (int i = 0; i < 64 && shown < 14; i++)
+            if (resolve(g_stk[i], x, sizeof x, true) && !strstr(x, "libc.so")) {
+                logf("[WD]    stk[%d]=%s", i, x); shown++;
+            }
+    }
+    closedir(d);
+}
+static void* wdThread(void*) {
+    int last = g_swaps, zero = 0, dumps = 0, n = 0;
+    while (1) {
+        sleep(1);
+        int cur = g_swaps, dl = cur - last; last = cur;
+        if (n < 90 && (n++ % 3) == 0) logf("[WD] swaps/s=%d", dl);
+        zero = (dl <= 2) ? zero + 1 : 0;
+        if (zero == 3 && dumps < 3) { dumps++; logf("[WD] STALL dump #%d", dumps); dumpThreads(); }
+        if (access("/storage/emulated/0/ap_dump", F_OK) == 0) {
+            remove("/storage/emulated/0/ap_dump");
+            logf("[WD] MANUAL dump"); dumpThreads();
+        }
+    }
+    return nullptr;
+}
+static void startWatch() {
+    if (g_wdStarted) return; g_wdStarted = 1;
+    struct sigaction sa; memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = sigh; sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigaction(WSIG, &sa, nullptr);
+    pthread_t t; pthread_create(&t, nullptr, wdThread, nullptr); pthread_detach(t);
+}
+
 static EGLSurface my_cws(EGLDisplay d, EGLConfig c, EGLWin w, const int* a) {
     EGLSurface s = orig_cws(d, c, w, a);
     g_d = d; g_surf = s; g_use = nullptr;
@@ -86,6 +174,7 @@ static EGLBoolean my_mc(EGLDisplay d, EGLSurface dr, EGLSurface rd, EGLContext c
     return r;
 }
 static EGLBoolean my_swap(EGLDisplay d, EGLSurface s) {
+    g_swaps++;
     EGLBoolean r = orig_swap(d, g_use ? g_use : s);
     if (!r && p_err() == 0x300D && g_rs && g_fix < 12) {
         EGLContext c = p_ctx ? p_ctx() : nullptr;
@@ -104,6 +193,7 @@ extern "C" {
 int antipause_init(void) {
     remove(LOGFILE);
     logf("[AP] init");
+    startWatch();
     void* h = dlopen("libGTASA.so", RTLD_NOW);
     if (!h) { logf("[AP] ERROR libGTASA"); return 0; }
     uintptr_t pe = sym(h, "_Z13ProcessEventsb");
