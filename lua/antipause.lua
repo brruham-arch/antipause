@@ -38,7 +38,7 @@ function main()
         return
     end
     local a = lib.antipause_init()
-    -- EGL hook: mulai nonaktif, aktifkan setelah patch terbukti jalan
-    -- local b = lib.antipause_egl_hook()
+
+    lib.antipause_egl_hook()
     sampAddChatMessage("[AP] init=" .. a, 0x00FFCC)
 end

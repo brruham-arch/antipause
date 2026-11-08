@@ -37,21 +37,43 @@ static void patch(const char* name, uintptr_t a, const uint8_t* old_b, int n_old
 }
 
 // ─── EGL fix ──────────────────────────────────────────────
-typedef void* EGLDisplay; typedef void* EGLSurface; typedef unsigned int EGLBoolean;
+#include <unistd.h>
+#include <sys/syscall.h>
+typedef void* EGLDisplay; typedef void* EGLSurface; typedef void* EGLContext;
+typedef void* EGLConfig; typedef void* EGLWin; typedef unsigned int EGLBoolean;
 static EGLBoolean (*orig_swap)(EGLDisplay, EGLSurface) = nullptr;
-static int   (*p_err)(void) = nullptr;
-static void* (*p_cursurf)(int) = nullptr;
-static int   (*nv_mc)(void) = nullptr;
-static int   g_fixLog = 0;
+static EGLBoolean (*orig_mc)(EGLDisplay, EGLSurface, EGLSurface, EGLContext) = nullptr;
+static EGLSurface (*orig_cws)(EGLDisplay, EGLConfig, EGLWin, const int*) = nullptr;
+static int        (*p_err)(void) = nullptr;
+static EGLContext (*p_ctx)(void) = nullptr;
+static EGLDisplay (*p_disp)(void) = nullptr;
+static EGLDisplay g_d = nullptr; static EGLSurface g_surf = nullptr; static EGLContext g_ctx = nullptr;
+static int g_n = 0, g_fix = 0;
+#define TID ((int)syscall(SYS_gettid))
 
+static EGLSurface my_cws(EGLDisplay d, EGLConfig c, EGLWin w, const int* a) {
+    EGLSurface s = orig_cws(d, c, w, a);
+    g_d = d; g_surf = s;
+    logf("[AP] cws tid=%d s=%p", TID, s);
+    return s;
+}
+static EGLBoolean my_mc(EGLDisplay d, EGLSurface dr, EGLSurface rd, EGLContext c) {
+    EGLBoolean r = orig_mc(d, dr, rd, c);
+    if (r && c) { g_ctx = c; g_d = d; }
+    if (g_n < 60) { g_n++; logf("[AP] mc tid=%d dr=%p c=%p r=%u", TID, dr, c, r); }
+    return r;
+}
 static EGLBoolean my_swap(EGLDisplay d, EGLSurface s) {
     EGLBoolean r = orig_swap(d, s);
-    if (!r && p_err && p_err() == 0x300D) {
-        if (g_fixLog < 20) { logf("[AP] swap BAD_SURFACE, rebind"); }
-        if (nv_mc) nv_mc();
-        void* ns = p_cursurf ? p_cursurf(0x3059) : nullptr;
-        r = orig_swap(d, ns ? ns : s);
-        if (g_fixLog++ < 20) logf("[AP] retry=%u", r);
+    if (!r && p_err() == 0x300D && g_surf && g_fix < 30) {
+        EGLContext c = p_ctx ? p_ctx() : nullptr;
+        if (!c) c = g_ctx;
+        EGLDisplay dd = d ? d : g_d;
+        EGLBoolean m = c ? orig_mc(dd, g_surf, g_surf, c) : 0;
+        int e = m ? 0 : p_err();
+        if (m) r = orig_swap(dd, g_surf);
+        logf("[AP] fix tid=%d surf=%p ctx=%p mc=%u err=%x swap=%u", TID, g_surf, c, m, e, r);
+        g_fix++;
     }
     return r;
 }
@@ -63,16 +85,13 @@ int antipause_init(void) {
     logf("[AP] init");
     void* h = dlopen("libGTASA.so", RTLD_NOW);
     if (!h) { logf("[AP] ERROR libGTASA"); return 0; }
-
     uintptr_t pe = sym(h, "_Z13ProcessEventsb");
     uintptr_t am = sym(h, "_Z14NVEventAppMainiPPc");
     if (!pe || !am) { logf("[AP] ERROR sym nil"); return 0; }
-
-    const uint8_t o8[]  = {0x30,0xF7,0xA2,0xEB}, o9[] = {0x30,0xF7,0x92,0xEB};
-    const uint8_t nop4[] = {0x00,0xBF,0x00,0xBF};
-    const uint8_t ol[]  = {0xF3,0xD1,0x08,0xE0}, nop2[] = {0x00,0xBF};
-    const uint8_t og[]  = {0x70,0xB1}, ng[] = {0x0E,0xE0};
-
+    const uint8_t o8[]={0x30,0xF7,0xA2,0xEB}, o9[]={0x30,0xF7,0x92,0xEB};
+    const uint8_t nop4[]={0x00,0xBF,0x00,0xBF};
+    const uint8_t ol[]={0xF3,0xD1,0x08,0xE0}, nop2[]={0x00,0xBF};
+    const uint8_t og[]={0x70,0xB1}, ng[]={0x0E,0xE0};
     patch("appevent8", pe + 0x1A0, o8, 4, nop4, 4);
     patch("appevent9", pe + 0x1C2, o9, 4, nop4, 4);
     patch("mainloop",  am + 0x13C, ol, 4, nop2, 2);
@@ -84,19 +103,22 @@ int antipause_egl_hook(void) {
     logf("[AP] egl hook");
     void* dob = dlopen("libdobby.so", RTLD_NOW | RTLD_GLOBAL);
     void* egl = dlopen("libEGL.so", RTLD_NOW);
-    void* gta = dlopen("libGTASA.so", RTLD_NOW);
     if (!dob || !egl) { logf("[AP] ERROR dobby/egl"); return 0; }
-
     int (*hook)(void*, void*, void**) = (int(*)(void*, void*, void**))dlsym(dob, "DobbyHook");
-    p_err     = (int(*)(void))dlsym(egl, "eglGetError");
-    p_cursurf = (void*(*)(int))dlsym(egl, "eglGetCurrentSurface");
-    nv_mc     = gta ? (int(*)(void))dlsym(gta, "NVEventEGLMakeCurrent") : nullptr;
-    void* swp = dlsym(egl, "eglSwapBuffers");
-    if (!hook || !swp) { logf("[AP] ERROR hook/swap nil"); return 0; }
-
-    int r = hook(swp, (void*)my_swap, (void**)&orig_swap);
-    logf("[AP] hook=%d nv_mc=%p", r, (void*)nv_mc);
-    return r == 0;
+    p_err  = (int(*)(void))dlsym(egl, "eglGetError");
+    p_ctx  = (EGLContext(*)(void))dlsym(egl, "eglGetCurrentContext");
+    p_disp = (EGLDisplay(*)(void))dlsym(egl, "eglGetCurrentDisplay");
+    g_ctx = p_ctx ? p_ctx() : nullptr;
+    g_d   = p_disp ? p_disp() : nullptr;
+    void* sw = dlsym(egl, "eglSwapBuffers");
+    void* mc = dlsym(egl, "eglMakeCurrent");
+    void* cw = dlsym(egl, "eglCreateWindowSurface");
+    if (!hook || !sw || !mc || !cw) { logf("[AP] ERROR hook nil"); return 0; }
+    int a = hook(cw, (void*)my_cws,  (void**)&orig_cws);
+    int b = hook(mc, (void*)my_mc,   (void**)&orig_mc);
+    int c = hook(sw, (void*)my_swap, (void**)&orig_swap);
+    logf("[AP] hooks cws=%d mc=%d swap=%d ctx=%p", a, b, c, g_ctx);
+    return !(a || b || c);
 }
 
 } // extern "C"
