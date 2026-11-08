@@ -51,7 +51,8 @@ static EGLDisplay g_d = nullptr; static EGLSurface g_surf = nullptr; static EGLC
 static int g_n = 0, g_fix = 0;
 #define TID ((int)syscall(SYS_gettid))
 
-static int g_glTid = 0, g_ok = 0, g_mcn = 0;
+static int g_glTid = 0, g_ok = 0, g_mcn = 0, g_jcfg = -1, g_rtid = 0;
+static EGLSurface g_rs = nullptr;
 static EGLSurface g_use = nullptr;
 static EGLContext (*orig_cc)(EGLDisplay, EGLConfig, EGLContext, const int*) = nullptr;
 static EGLBoolean (*orig_ds)(EGLDisplay, EGLSurface) = nullptr;
@@ -62,6 +63,8 @@ static EGLSurface my_cws(EGLDisplay d, EGLConfig c, EGLWin w, const int* a) {
     EGLSurface s = orig_cws(d, c, w, a);
     g_d = d; g_surf = s; g_use = nullptr;
     int cid = -1; if (p_qsurf && s) p_qsurf(d, s, 0x3028, &cid);
+    if (g_jcfg < 0) g_jcfg = cid;
+    else if (cid != g_jcfg && s) { g_rs = s; g_rtid = TID; g_use = nullptr; }
     logf("[AP] cws tid=%d s=%p cfg=%p cfgid=%d", TID, s, c, cid);
     return s;
 }
@@ -72,6 +75,7 @@ static EGLContext my_cc(EGLDisplay d, EGLConfig c, EGLContext sh, const int* a) 
     return r;
 }
 static EGLBoolean my_ds(EGLDisplay d, EGLSurface s) {
+    if (s && s == g_rs && TID != g_rtid) { logf("[AP] skip ds tid=%d s=%p", TID, s); return 1; }
     logf("[AP] ds tid=%d s=%p", TID, s);
     return orig_ds(d, s);
 }
@@ -82,15 +86,14 @@ static EGLBoolean my_mc(EGLDisplay d, EGLSurface dr, EGLSurface rd, EGLContext c
     return r;
 }
 static EGLBoolean my_swap(EGLDisplay d, EGLSurface s) {
-    EGLBoolean r = orig_swap(d, s);
-    if (!r && p_err() == 0x300D && g_surf && g_fix < 8) {
+    EGLBoolean r = orig_swap(d, g_use ? g_use : s);
+    if (!r && p_err() == 0x300D && g_rs && g_fix < 12) {
         EGLContext c = p_ctx ? p_ctx() : nullptr;
         EGLDisplay dd = d ? d : g_d;
-        int cid = -1; if (p_qctx && c) p_qctx(dd, c, 0x3028, &cid);
-        EGLBoolean m = c ? orig_mc(dd, g_surf, g_surf, c) : 0;
+        EGLBoolean m = c ? orig_mc(dd, g_rs, g_rs, c) : 0;
         int e = m ? 0 : p_err();
-        if (m) r = orig_swap(dd, g_surf);
-        logf("[AP] fix tid=%d old=%p new=%p ctx=%p ctxcfgid=%d mc=%u err=%x swap=%u", TID, s, g_surf, c, cid, m, e, r);
+        if (m) { r = orig_swap(dd, g_rs); if (r) g_use = g_rs; }
+        logf("[AP] fix tid=%d rs=%p ctx=%p mc=%u err=%x swap=%u", TID, g_rs, c, m, e, r);
         g_fix++;
     }
     return r;
