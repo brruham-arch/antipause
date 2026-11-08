@@ -1,0 +1,25 @@
+name: build
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r25c
+      - name: Build armeabi-v7a
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_TOOLCHAIN_FILE=${{ steps.ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=armeabi-v7a -DANDROID_PLATFORM=android-21 \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libantipause
+          path: build/libantipause.so
