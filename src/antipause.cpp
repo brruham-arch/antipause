@@ -51,27 +51,36 @@ static EGLDisplay g_d = nullptr; static EGLSurface g_surf = nullptr; static EGLC
 static int g_n = 0, g_fix = 0;
 #define TID ((int)syscall(SYS_gettid))
 
+static int g_glTid = 0, g_ok = 0;
+static EGLSurface g_use = nullptr;
+
 static EGLSurface my_cws(EGLDisplay d, EGLConfig c, EGLWin w, const int* a) {
     EGLSurface s = orig_cws(d, c, w, a);
-    g_d = d; g_surf = s;
+    g_d = d; g_surf = s; g_use = nullptr;
     logf("[AP] cws tid=%d s=%p", TID, s);
     return s;
 }
 static EGLBoolean my_mc(EGLDisplay d, EGLSurface dr, EGLSurface rd, EGLContext c) {
     EGLBoolean r = orig_mc(d, dr, rd, c);
     if (r && c) { g_ctx = c; g_d = d; }
-    if (g_n < 60) { g_n++; logf("[AP] mc tid=%d dr=%p c=%p r=%u", TID, dr, c, r); }
+    if (r && dr && g_glTid && TID != g_glTid) {
+        // thread Java: lepas surface supaya thread render bisa bind
+        g_surf = dr; g_use = nullptr;
+        orig_mc(d, nullptr, nullptr, c);
+        logf("[AP] release surf=%p from tid=%d", dr, TID);
+    }
     return r;
 }
 static EGLBoolean my_swap(EGLDisplay d, EGLSurface s) {
-    EGLBoolean r = orig_swap(d, s);
-    if (!r && p_err() == 0x300D && g_surf && g_fix < 30) {
+    if (!g_glTid) g_glTid = TID;
+    EGLBoolean r = orig_swap(d, g_use ? g_use : s);
+    if (!r && p_err() == 0x300D && g_surf && g_fix < 40) {
         EGLContext c = p_ctx ? p_ctx() : nullptr;
         if (!c) c = g_ctx;
         EGLDisplay dd = d ? d : g_d;
         EGLBoolean m = c ? orig_mc(dd, g_surf, g_surf, c) : 0;
         int e = m ? 0 : p_err();
-        if (m) r = orig_swap(dd, g_surf);
+        if (m) { r = orig_swap(dd, g_surf); if (r) g_use = g_surf; }
         logf("[AP] fix tid=%d surf=%p ctx=%p mc=%u err=%x swap=%u", TID, g_surf, c, m, e, r);
         g_fix++;
     }
