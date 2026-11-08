@@ -207,6 +207,16 @@ int antipause_init(void) {
     patch("appevent9", pe + 0x1C2, o9, 4, nop4, 4);
     patch("mainloop",  am + 0x13C, ol, 4, nop2, 2);
     patch("gfxthread", pe - 0x269354 + 0x1D2288, og, 2, ng, 2);
+    uintptr_t sc = sym(h, "_Z19OS_SystemCheckPausei");
+    if (!sc) sc = pe - 0x269354 + 0x26A82C;
+    const uint8_t mk[] = {0x34,0xF7,0xAC,0xEB};
+    if (memcmp((void*)(sc + 0x56), mk, 4) == 0) {
+        const uint8_t nb[] = {0x00,0x20,0x70,0x47};
+        mprotect((void*)(sc & ~(uintptr_t)0xFFF), 0x2000, PROT_READ|PROT_WRITE|PROT_EXEC);
+        memcpy((void*)sc, nb, 4);
+        __builtin___clear_cache((char*)sc, (char*)sc + 4);
+        logf("[AP] syscheckpause ok");
+    } else logf("[AP] syscheckpause mismatch");
     return 1;
 }
 
