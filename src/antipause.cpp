@@ -51,37 +51,46 @@ static EGLDisplay g_d = nullptr; static EGLSurface g_surf = nullptr; static EGLC
 static int g_n = 0, g_fix = 0;
 #define TID ((int)syscall(SYS_gettid))
 
-static int g_glTid = 0, g_ok = 0;
+static int g_glTid = 0, g_ok = 0, g_mcn = 0;
 static EGLSurface g_use = nullptr;
+static EGLContext (*orig_cc)(EGLDisplay, EGLConfig, EGLContext, const int*) = nullptr;
+static EGLBoolean (*orig_ds)(EGLDisplay, EGLSurface) = nullptr;
+static EGLBoolean (*p_qctx)(EGLDisplay, EGLContext, int, int*) = nullptr;
+static EGLBoolean (*p_qsurf)(EGLDisplay, EGLSurface, int, int*) = nullptr;
 
 static EGLSurface my_cws(EGLDisplay d, EGLConfig c, EGLWin w, const int* a) {
     EGLSurface s = orig_cws(d, c, w, a);
     g_d = d; g_surf = s; g_use = nullptr;
-    logf("[AP] cws tid=%d s=%p", TID, s);
+    int cid = -1; if (p_qsurf && s) p_qsurf(d, s, 0x3028, &cid);
+    logf("[AP] cws tid=%d s=%p cfg=%p cfgid=%d", TID, s, c, cid);
     return s;
+}
+static EGLContext my_cc(EGLDisplay d, EGLConfig c, EGLContext sh, const int* a) {
+    EGLContext r = orig_cc(d, c, sh, a);
+    int cid = -1; if (p_qctx && r) p_qctx(d, r, 0x3028, &cid);
+    logf("[AP] cc tid=%d ctx=%p cfg=%p cfgid=%d share=%p", TID, r, c, cid, sh);
+    return r;
+}
+static EGLBoolean my_ds(EGLDisplay d, EGLSurface s) {
+    logf("[AP] ds tid=%d s=%p", TID, s);
+    return orig_ds(d, s);
 }
 static EGLBoolean my_mc(EGLDisplay d, EGLSurface dr, EGLSurface rd, EGLContext c) {
     EGLBoolean r = orig_mc(d, dr, rd, c);
     if (r && c) { g_ctx = c; g_d = d; }
-    if (r && dr && g_glTid && TID != g_glTid) {
-        // thread Java: lepas surface supaya thread render bisa bind
-        g_surf = dr; g_use = nullptr;
-        orig_mc(d, nullptr, nullptr, c);
-        logf("[AP] release surf=%p from tid=%d", dr, TID);
-    }
+    if (g_mcn < 40) { g_mcn++; logf("[AP] mc tid=%d dr=%p c=%p r=%u", TID, dr, c, r); }
     return r;
 }
 static EGLBoolean my_swap(EGLDisplay d, EGLSurface s) {
-    if (!g_glTid) g_glTid = TID;
-    EGLBoolean r = orig_swap(d, g_use ? g_use : s);
-    if (!r && p_err() == 0x300D && g_surf && g_fix < 40) {
+    EGLBoolean r = orig_swap(d, s);
+    if (!r && p_err() == 0x300D && g_surf && g_fix < 8) {
         EGLContext c = p_ctx ? p_ctx() : nullptr;
-        if (!c) c = g_ctx;
         EGLDisplay dd = d ? d : g_d;
+        int cid = -1; if (p_qctx && c) p_qctx(dd, c, 0x3028, &cid);
         EGLBoolean m = c ? orig_mc(dd, g_surf, g_surf, c) : 0;
         int e = m ? 0 : p_err();
-        if (m) { r = orig_swap(dd, g_surf); if (r) g_use = g_surf; }
-        logf("[AP] fix tid=%d surf=%p ctx=%p mc=%u err=%x swap=%u", TID, g_surf, c, m, e, r);
+        if (m) r = orig_swap(dd, g_surf);
+        logf("[AP] fix tid=%d old=%p new=%p ctx=%p ctxcfgid=%d mc=%u err=%x swap=%u", TID, s, g_surf, c, cid, m, e, r);
         g_fix++;
     }
     return r;
@@ -123,6 +132,12 @@ int antipause_egl_hook(void) {
     void* mc = dlsym(egl, "eglMakeCurrent");
     void* cw = dlsym(egl, "eglCreateWindowSurface");
     if (!hook || !sw || !mc || !cw) { logf("[AP] ERROR hook nil"); return 0; }
+    p_qctx  = (EGLBoolean(*)(EGLDisplay,EGLContext,int,int*))dlsym(egl, "eglQueryContext");
+    p_qsurf = (EGLBoolean(*)(EGLDisplay,EGLSurface,int,int*))dlsym(egl, "eglQuerySurface");
+    void* ccp = dlsym(egl, "eglCreateContext");
+    void* dsp = dlsym(egl, "eglDestroySurface");
+    if (ccp) hook(ccp, (void*)my_cc, (void**)&orig_cc);
+    if (dsp) hook(dsp, (void*)my_ds, (void**)&orig_ds);
     int a = hook(cw, (void*)my_cws,  (void**)&orig_cws);
     int b = hook(mc, (void*)my_mc,   (void**)&orig_mc);
     int c = hook(sw, (void*)my_swap, (void**)&orig_swap);
