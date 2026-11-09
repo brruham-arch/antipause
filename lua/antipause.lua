@@ -27,6 +27,7 @@ copyFile(soSrc, soDst)
 ffi.cdef[[
 int antipause_init(void);
 int antipause_egl_hook(void);
+void antipause_set_bg(int ms);
 ]]
 
 local ok, lib = pcall(ffi.load, soDst)
@@ -41,4 +42,11 @@ function main()
 
     lib.antipause_egl_hook()
     sampAddChatMessage("[AP] init=" .. a, 0x00FFCC)
+    local bg = 33
+    sampRegisterChatCommand("apbg", function(arg)
+        local v = tonumber(arg)
+        if v then bg = v else bg = (bg > 0) and 0 or 33 end
+        lib.antipause_set_bg(bg)
+        sampAddChatMessage("[AP] bg delay=" .. bg .. " ms", 0x00FFCC)
+    end)
 end
