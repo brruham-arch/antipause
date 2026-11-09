@@ -4,6 +4,7 @@
 #include <string.h>
 #include <dlfcn.h>
 #include <unistd.h>
+#include <time.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 
@@ -48,7 +49,8 @@ static volatile EGLSurface g_rs = nullptr, g_use = nullptr;
 static volatile int g_jcfg = -1, g_rtid = 0;
 static int g_fix = 0;
 static int (*p_paused)(void) = nullptr;
-static volatile int g_bgms = 33;
+static volatile int g_bgms = 25;
+static long long g_lastT = 0;
 static unsigned g_bgf = 0;
 static int g_lastp = -1;
 
@@ -69,7 +71,15 @@ static EGLBoolean my_swap(EGLDisplay d, EGLSurface s) {
     if (p_paused && g_bgms > 0) {
         int pz = p_paused() ? 1 : 0;
         if (pz != g_lastp) { g_lastp = pz; logf("[AP] bg=%d", pz); }
-        if (pz) { usleep(g_bgms * 1000); if (++g_bgf & 3) return 1; }
+        if (pz) {
+            struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+            long long now = ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
+            long long wait = 1000000LL / g_bgms - (now - g_lastT);
+            if (wait > 0 && wait < 200000) usleep((useconds_t)wait);
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            g_lastT = ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
+            if (++g_bgf & 1) return 1;
+        }
     }
     EGLSurface u = g_use;
     EGLBoolean r = orig_swap(d, u ? u : s);
@@ -113,7 +123,7 @@ int antipause_init(void) {
     return 1;
 }
 
-void antipause_set_bg(int ms) { g_bgms = ms < 0 ? 0 : ms; }
+void antipause_set_bg(int fps) { g_bgms = fps < 0 ? 0 : (fps > 60 ? 60 : fps); }
 
 int antipause_egl_hook(void) {
     void* dob = dlopen("libdobby.so", RTLD_NOW | RTLD_GLOBAL);
