@@ -4,7 +4,6 @@
 #include <string.h>
 #include <dlfcn.h>
 #include <unistd.h>
-#include <time.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 
@@ -48,11 +47,6 @@ static EGLBoolean (*p_qsurf)(EGLDisplay, EGLSurface, int, int*) = nullptr;
 static volatile EGLSurface g_rs = nullptr, g_use = nullptr;
 static volatile int g_jcfg = -1, g_rtid = 0;
 static int g_fix = 0;
-static int (*p_paused)(void) = nullptr;
-static volatile int g_bgms = 25;
-static long long g_lastT = 0;
-static unsigned g_bgf = 0;
-static int g_lastp = -1;
 
 static EGLSurface my_cws(EGLDisplay d, EGLConfig c, EGLWin w, const int* a) {
     EGLSurface s = orig_cws(d, c, w, a);
@@ -68,19 +62,6 @@ static EGLBoolean my_ds(EGLDisplay d, EGLSurface s) {
 }
 
 static EGLBoolean my_swap(EGLDisplay d, EGLSurface s) {
-    if (p_paused && g_bgms > 0) {
-        int pz = p_paused() ? 1 : 0;
-        if (pz != g_lastp) { g_lastp = pz; logf("[AP] bg=%d", pz); }
-        if (pz) {
-            struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-            long long now = ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
-            long long wait = 1000000LL / g_bgms - (now - g_lastT);
-            if (wait > 0 && wait < 200000) usleep((useconds_t)wait);
-            clock_gettime(CLOCK_MONOTONIC, &ts);
-            g_lastT = ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
-            if (++g_bgf & 1) return 1;
-        }
-    }
     EGLSurface u = g_use;
     EGLBoolean r = orig_swap(d, u ? u : s);
     EGLSurface rs = g_rs;
@@ -123,8 +104,6 @@ int antipause_init(void) {
     return 1;
 }
 
-void antipause_set_bg(int fps) { g_bgms = fps < 0 ? 0 : (fps > 60 ? 60 : fps); }
-
 int antipause_egl_hook(void) {
     void* dob = dlopen("libdobby.so", RTLD_NOW | RTLD_GLOBAL);
     void* egl = dlopen("libEGL.so", RTLD_NOW);
@@ -137,9 +116,6 @@ int antipause_egl_hook(void) {
     void* sw = dlsym(egl, "eglSwapBuffers");
     void* cw = dlsym(egl, "eglCreateWindowSurface");
     void* ds = dlsym(egl, "eglDestroySurface");
-    void* gta = dlopen("libGTASA.so", RTLD_NOW);
-    p_paused = gta ? (int(*)(void))dlsym(gta, "_Z13AndroidPausedv") : nullptr;
-    logf("[AP] paused fn=%p", (void*)p_paused);
     if (!hook || !sw || !cw || !ds || !orig_mc || !p_err) return 0;
     int a = hook(cw, (void*)my_cws,  (void**)&orig_cws);
     int b = hook(ds, (void*)my_ds,   (void**)&orig_ds);
